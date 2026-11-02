@@ -176,15 +176,43 @@ class TelethonEvent(AstrMessageEvent):
         reply_to: int | None,
         link_preview: bool,
     ) -> Any:
-        return await self._request_sender().send_text(
+        result = await self._request_sender().send_text(
             text,
             parse_mode=parse_mode,
             reply_to_msg_id=reply_to,
             link_preview=link_preview,
             force_low_level=self._should_use_low_level_text_request(),
         )
+        self._record_sent_receipt(result)
+        return result
+
+    def _record_sent_receipt(self, result: Any) -> None:
+        """Record Telegram message ids returned by a successful send request.
+
+        Frisk local patch: the ids are the only send evidence downstream
+        plugins may trust (``after_message_sent`` also fires after a failed
+        send). Stored as event extra ``telethon_sent_message_ids``.
+        """
+        items = result if isinstance(result, (list, tuple)) else [result]
+        ids = []
+        for item in items:
+            msg_id = getattr(item, "id", None)
+            if isinstance(msg_id, int) and msg_id > 0:
+                ids.append(msg_id)
+        if not ids:
+            return
+        try:
+            existing = list(self.get_extra("telethon_sent_message_ids", []) or [])
+            self.set_extra("telethon_sent_message_ids", existing + ids)
+        except Exception:
+            pass
 
     async def _send_media_request(self, action: MediaAction) -> Any:
+        result = await self._send_media_request_inner(action)
+        self._record_sent_receipt(result)
+        return result
+
+    async def _send_media_request_inner(self, action: MediaAction) -> Any:
         action = await self._normalize_media_action_caption(action)
         if not self._should_use_low_level_media_request(spoiler=action.spoiler):
             return await self._request_sender().send_media_action(

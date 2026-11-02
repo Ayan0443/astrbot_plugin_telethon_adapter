@@ -15,6 +15,7 @@ FIELD_SPECS = {
     },
     "trigger_prefix": {"type": "string"},
     "reply_to_self_triggers_command": {"type": "bool"},
+    "group_self_mention_wakeup": {"type": "bool"},
     "download_incoming_media": {"type": "bool"},
     "incoming_media_ttl_seconds": {"type": "float"},
     "log_processed_messages_only": {"type": "bool"},
@@ -68,6 +69,7 @@ DEFAULT_CONFIG_TEMPLATE = {
     "language": DEFAULT_LANGUAGE,
     "trigger_prefix": "-astr",
     "reply_to_self_triggers_command": False,
+    "group_self_mention_wakeup": True,
     "download_incoming_media": True,
     "incoming_media_ttl_seconds": 600.0,
     "log_processed_messages_only": True,
@@ -162,6 +164,9 @@ def apply_config(adapter: Any) -> None:
     adapter.trigger_prefix = parse_str(adapter.config.get("trigger_prefix"), "")
     adapter.reply_to_self_triggers_command = parse_bool(
         adapter.config.get("reply_to_self_triggers_command"), False
+    )
+    adapter.group_self_mention_wakeup = parse_bool(
+        adapter.config.get("group_self_mention_wakeup"), True
     )
     adapter.download_incoming_media = parse_bool(
         adapter.config.get("download_incoming_media"), True

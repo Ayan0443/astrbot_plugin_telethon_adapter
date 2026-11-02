@@ -81,6 +81,7 @@ class TelethonPlatformAdapter(Platform):
         self.client: TelegramClient | None = None
         self.self_id = ""
         self.self_username = ""
+        self.self_usernames: set[str] = set()
         self._running = False
         self._stop_requested = False
         self._main_task: asyncio.Task | None = None
@@ -231,6 +232,32 @@ class TelethonPlatformAdapter(Platform):
         await message_event.send(message_chain)
         await super().send_by_session(session, message_chain)
 
+    async def send_with_receipt(
+        self, session: MessageSesion, message_chain: MessageChain
+    ) -> list[int]:
+        """Send like ``send_by_session`` but return Telegram message ids.
+
+        Frisk local patch. Raises on failure; an empty list means Telegram
+        returned no message object (treat as unconfirmed, not as sent).
+        """
+        if not self.client:
+            raise RuntimeError("[Telethon] Client is not initialized")
+        inner_message = AstrBotMessage()
+        inner_message.session_id = session.session_id
+        inner_message.type = session.message_type
+        message_event = TelethonEvent(
+            message_str=message_chain.get_plain_text(),
+            message_obj=inner_message,
+            platform_meta=self.meta(),
+            session_id=session.session_id,
+            client=self.client,
+        )
+        message_event.adapter_capability = self._build_adapter_capability()
+        message_event.telethon_language = self.language
+        await message_event.send(message_chain)
+        await super().send_by_session(session, message_chain)
+        return list(message_event.get_extra("telethon_sent_message_ids", []) or [])
+
     def get_client(self):
         return self.client
 
@@ -245,17 +272,30 @@ class TelethonPlatformAdapter(Platform):
 
         me = await self.client.get_me()
         self.self_id = str(me.id)
-        self.self_username = str(getattr(me, "username", "") or "").strip().lower()
+        names: list[str] = []
+        primary = str(getattr(me, "username", "") or "").strip().lower()
+        if primary:
+            names.append(primary)
+        # Accounts with multiple / collectible usernames expose them via
+        # ``me.usernames`` while ``me.username`` may be None.
+        for item in getattr(me, "usernames", None) or []:
+            name = str(getattr(item, "username", "") or "").strip().lower()
+            if name and getattr(item, "active", True) and name not in names:
+                names.append(name)
+        self.self_usernames = set(names)
+        self.self_username = names[0] if names else ""
         self._update_premium_status(me)
         self._start_premium_refresh_task()
 
         logger.info(
-            "[Telethon] Userbot started: %s username=%s "
+            "[Telethon] Userbot started: %s username=%s usernames=%s group_self_mention_wakeup=%s "
             "download_incoming_media=%s incoming_media_ttl_seconds=%s "
             "trigger_prefix=%r reply_to_self_triggers_command=%s log_processed_messages_only=%s proxy_type=%s "
             "proxy_host=%s proxy_port=%s fast_upload_enabled=%s raw_event_debug=%s raw_config=%s",
             self.self_id,
             self.self_username,
+            sorted(self.self_usernames),
+            getattr(self, "group_self_mention_wakeup", True),
             self.download_incoming_media,
             self.incoming_media_ttl_seconds,
             self.trigger_prefix,
