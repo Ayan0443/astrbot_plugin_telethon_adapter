@@ -19,8 +19,10 @@ try:
 except ImportError:
     convert_audio_to_wav = None
 
-# 视频贴纸（.webm/.mp4）无法被 PIL 直接识别，抽一帧转 PNG 后再交给上层。
+# 视频贴纸（.webm/.mp4）与 TGS 动画贴纸都无法被 PIL 直接识别，
+# 先转成一张 PNG 再交给上层。
 _VIDEO_LIKE_SUFFIXES = {".webm", ".mp4", ".mov", ".mkv"}
+_TGS_SUFFIX = ".tgs"
 _FRAME_MAX_EDGE = 512
 
 
@@ -80,13 +82,23 @@ class TelethonLazyMedia:
             return self._downloaded_path
 
     async def ensure_image_frame(self, original: str) -> str:
-        """视频贴纸抽第一帧为 PNG，并缓存结果。"""
+        """把视频/动画贴纸转成第一帧 PNG，并缓存结果。"""
         if self._frame_path and os.path.exists(self._frame_path):
             return self._frame_path
 
         async with self._frame_lock:
             if self._frame_path and os.path.exists(self._frame_path):
                 return self._frame_path
+
+            if original.lower().endswith(_TGS_SUFFIX):
+                try:
+                    converted = extract_tgs_frame(original)
+                except Exception as exc:
+                    logger.warning("[Telethon] TGS 贴纸渲染失败，回退原文件: %s", exc)
+                    return original
+                self.register_temp_file(converted)
+                self._frame_path = converted
+                return converted
 
             ffmpeg = shutil.which("ffmpeg")
             if not ffmpeg:
@@ -105,6 +117,18 @@ class TelethonLazyMedia:
             self.register_temp_file(converted)
             self._frame_path = converted
             return converted
+
+
+def extract_tgs_frame(tgs_path: str) -> str:
+    """把 TGS 动画贴纸渲染为第一帧 PNG。"""
+    from rlottie_python import LottieAnimation
+
+    target = os.path.splitext(tgs_path)[0] + ".frame.png"
+    with LottieAnimation.from_tgs(tgs_path) as anim:
+        image = anim.render_pillow_frame(frame_num=0)
+        image.thumbnail((_FRAME_MAX_EDGE, _FRAME_MAX_EDGE))
+        image.save(target)
+    return os.path.abspath(target)
 
 
 async def extract_video_frame(video_path: str, ffmpeg: str) -> str:
@@ -146,7 +170,8 @@ class LazyImage(Image):
 
     async def convert_to_file_path(self) -> str:
         original = await self._downloader.ensure_downloaded()
-        if Path(original).suffix.lower() not in _VIDEO_LIKE_SUFFIXES:
+        suffix = Path(original).suffix.lower()
+        if suffix not in _VIDEO_LIKE_SUFFIXES and suffix != _TGS_SUFFIX:
             return original
         return await self._downloader.ensure_image_frame(original)
 
