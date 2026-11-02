@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,6 +19,10 @@ try:
 except ImportError:
     convert_audio_to_wav = None
 
+# 视频贴纸（.webm/.mp4）无法被 PIL 直接识别，抽一帧转 PNG 后再交给上层。
+_VIDEO_LIKE_SUFFIXES = {".webm", ".mp4", ".mov", ".mkv"}
+_FRAME_MAX_EDGE = 512
+
 
 class TelethonLazyMedia:
     def __init__(
@@ -33,6 +38,8 @@ class TelethonLazyMedia:
         self._fallback_name = fallback_name
         self._downloaded_path: str | None = None
         self._lock = asyncio.Lock()
+        self._frame_path: str | None = None
+        self._frame_lock = asyncio.Lock()
 
     def register_temp_file(self, path: str) -> None:
         self._register_temp_file(path)
@@ -72,6 +79,63 @@ class TelethonLazyMedia:
             self.register_temp_file(self._downloaded_path)
             return self._downloaded_path
 
+    async def ensure_image_frame(self, original: str) -> str:
+        """视频贴纸抽第一帧为 PNG，并缓存结果。"""
+        if self._frame_path and os.path.exists(self._frame_path):
+            return self._frame_path
+
+        async with self._frame_lock:
+            if self._frame_path and os.path.exists(self._frame_path):
+                return self._frame_path
+
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                logger.warning(
+                    "[Telethon] ffmpeg 不可用，视频贴纸无法转成图片，回退原文件: %s",
+                    original,
+                )
+                return original
+
+            try:
+                converted = await extract_video_frame(original, ffmpeg)
+            except Exception as exc:
+                logger.warning("[Telethon] 视频贴纸抽帧失败，回退原文件: %s", exc)
+                return original
+
+            self.register_temp_file(converted)
+            self._frame_path = converted
+            return converted
+
+
+async def extract_video_frame(video_path: str, ffmpeg: str) -> str:
+    """把视频抽一帧存为 PNG，供需要位图的链路使用。"""
+    target = os.path.splitext(video_path)[0] + ".frame.png"
+    scale = (
+        f"scale='if(gt(iw,ih),min({_FRAME_MAX_EDGE},iw),-2)'"
+        f":'if(gt(iw,ih),-2,min({_FRAME_MAX_EDGE},ih))'"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        video_path,
+        "-frames:v",
+        "1",
+        "-vf",
+        scale,
+        target,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0 or not os.path.exists(target):
+        raise RuntimeError(
+            f"ffmpeg failed ({proc.returncode}): {stderr.decode('utf-8', 'ignore')[:200]}"
+        )
+    return os.path.abspath(target)
+
 
 class LazyImage(Image):
     _downloader: TelethonLazyMedia = PrivateAttr()
@@ -81,7 +145,10 @@ class LazyImage(Image):
         object.__setattr__(self, "_downloader", downloader)
 
     async def convert_to_file_path(self) -> str:
-        return await self._downloader.ensure_downloaded()
+        original = await self._downloader.ensure_downloaded()
+        if Path(original).suffix.lower() not in _VIDEO_LIKE_SUFFIXES:
+            return original
+        return await self._downloader.ensure_image_frame(original)
 
 
 class LazyRecord(Record):
