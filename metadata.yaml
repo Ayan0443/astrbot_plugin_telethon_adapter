@@ -1,8 +1,8 @@
 name: telethon_adapter
 desc: Telethon-based Telegram Userbot adapter / 基于 Telethon 的 Telegram Userbot 适配器
-version: 0.10.0
-author: outlook84
-repo: https://github.com/outlook84/astrbot_plugin_telethon_adapter
+version: 0.10.0-lifelike.1
+author: outlook84, Ayan0443
+repo: https://github.com/Ayan0443/astrbot_plugin_telethon_adapter
 display_name: Telegram Userbot Adapter
 support_platforms:
   - telethon_userbot

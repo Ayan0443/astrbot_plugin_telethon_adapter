@@ -36,6 +36,10 @@ CONFIG_FIELD_TEXTS = {
             "description": "回复自己触发命令",
             "hint": "仅群聊生效。开启后，回复当前 Telethon 账号发出的消息时，也视为一次唤醒。默认关闭。",
         },
+        "group_self_mention_wakeup": {
+            "description": "群聊 @ 自己唤醒",
+            "hint": "仅群聊、触发前缀留空时有意义。开启后，在群里 @ 当前账号（用户名或文字提及）视为一次唤醒。默认开启。",
+        },
         "download_incoming_media": {
             "description": "下载入站媒体",
             "hint": "关闭后，不下载收到的图片、文件、音视频附件。",
@@ -119,6 +123,10 @@ CONFIG_FIELD_TEXTS = {
         "reply_to_self_triggers_command": {
             "description": "Reply To Self Triggers Command",
             "hint": "Group chats only. When enabled, replying to a message sent by the current Telethon account is also treated as a wake-up trigger. Disabled by default.",
+        },
+        "group_self_mention_wakeup": {
+            "description": "Group Self Mention Wakeup",
+            "hint": "Group chats with an empty trigger prefix. When enabled, @-mentioning the current account (username or text mention) is treated as a wake-up trigger. Enabled by default.",
         },
         "download_incoming_media": {
             "description": "Download Incoming Media",

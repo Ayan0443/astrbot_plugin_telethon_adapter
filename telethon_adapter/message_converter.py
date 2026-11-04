@@ -143,7 +143,9 @@ class TelethonMessageConverter:
         message = AstrBotMessage()
         message.session_id = session_id
         message.message_id = str(msg.id)
-        message.self_id = self.adapter.self_username or self.adapter.self_id
+        # 统一用数字 ID 作为自身标识：Reply.sender_id、窗口里自己的发言、
+        # 各收集器都按数字 ID 比较；@自己 时 entity_to_at 也输出数字 ID。
+        message.self_id = str(self.adapter.self_id or "") or self.adapter.self_username
         message.raw_message = msg
         message.sender = MessageMember(
             user_id=str(getattr(sender, "id", "0")),
@@ -156,7 +158,11 @@ class TelethonMessageConverter:
             message.type = MessageType.GROUP_MESSAGE
             message.group_id = session_id
 
-        preserve_group_mention_wakeup = not is_private and not self.adapter.trigger_prefix
+        preserve_group_mention_wakeup = (
+            not is_private
+            and not self.adapter.trigger_prefix
+            and not getattr(self.adapter, "group_self_mention_wakeup", False)
+        )
         if preserve_group_mention_wakeup:
             message.message_str = msg.raw_text or ""
         else:
@@ -427,11 +433,18 @@ class TelethonMessageConverter:
 
     def is_self_mention(self, entity: Any, entity_text: str) -> bool:
         username = str(getattr(self.adapter, "self_username", "") or "").strip().lower()
+        usernames = {
+            str(n).strip().lower()
+            for n in (getattr(self.adapter, "self_usernames", None) or ())
+            if str(n).strip()
+        }
+        if username:
+            usernames.add(username)
         self_id = str(getattr(self.adapter, "self_id", "") or "").strip()
         cleaned = entity_text.strip().lstrip("@").lower()
 
         if isinstance(entity, MessageEntityMention):
-            return bool(username and cleaned == username)
+            return bool(cleaned and cleaned in usernames)
 
         if isinstance(entity, MessageEntityMentionName):
             user_id = str(getattr(entity, "user_id", "") or "").strip()
@@ -542,6 +555,15 @@ class TelethonMessageConverter:
 
     def entity_to_at(self, entity: Any, entity_text: str) -> At | None:
         cleaned = entity_text.strip()
+        if self.is_self_mention(entity, entity_text):
+            # Must equal AstrBotMessage.self_id so AstrBot's waking check matches.
+            self_key = str(
+                getattr(self.adapter, "self_id", "")
+                or getattr(self.adapter, "self_username", "")
+                or ""
+            )
+            if self_key:
+                return At(qq=self_key, name=cleaned.lstrip("@") or self_key)
         if isinstance(entity, MessageEntityMention):
             username = cleaned.lstrip("@")
             if username:

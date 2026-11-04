@@ -1,5 +1,7 @@
 # Telethon Userbot 适配器
 
+> 这是 [outlook84/astrbot_plugin_telethon_adapter](https://github.com/outlook84/astrbot_plugin_telethon_adapter) 的修改版（GPL-2.0），配合 [Iris 活人感分支](https://github.com/Ayan0443/astrbot_plugin_iris_memory) 使用：增加发送回执、动态贴纸预览帧、致命错误看门狗、日志去正文，并修复了语音消息无法转写的问题。改动清单见 [MODIFICATIONS.md](MODIFICATIONS.md)。开箱即用请看 [Ayan0443/astrbot-lifelike-starter](https://github.com/Ayan0443/astrbot-lifelike-starter)。
+
 为 AstrBot 增加基于 Telethon 的 Telegram Userbot 适配器。
 
 > 重要：建议始终配合 AstrBot 的会话白名单使用本插件。如果未配置白名单，存在与其它 Bot 之间互相回复、形成消息循环的风险。

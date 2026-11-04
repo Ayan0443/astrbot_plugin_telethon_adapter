@@ -15,6 +15,7 @@ FIELD_SPECS = {
     },
     "trigger_prefix": {"type": "string"},
     "reply_to_self_triggers_command": {"type": "bool"},
+    "group_self_mention_wakeup": {"type": "bool"},
     "download_incoming_media": {"type": "bool"},
     "incoming_media_ttl_seconds": {"type": "float"},
     "log_processed_messages_only": {"type": "bool"},
@@ -68,6 +69,7 @@ DEFAULT_CONFIG_TEMPLATE = {
     "language": DEFAULT_LANGUAGE,
     "trigger_prefix": "-astr",
     "reply_to_self_triggers_command": False,
+    "group_self_mention_wakeup": True,
     "download_incoming_media": True,
     "incoming_media_ttl_seconds": 600.0,
     "log_processed_messages_only": True,
@@ -163,6 +165,9 @@ def apply_config(adapter: Any) -> None:
     adapter.reply_to_self_triggers_command = parse_bool(
         adapter.config.get("reply_to_self_triggers_command"), False
     )
+    adapter.group_self_mention_wakeup = parse_bool(
+        adapter.config.get("group_self_mention_wakeup"), True
+    )
     adapter.download_incoming_media = parse_bool(
         adapter.config.get("download_incoming_media"), True
     )
@@ -194,6 +199,18 @@ def apply_config(adapter: Any) -> None:
     adapter.proxy_password = str(adapter.config.get("proxy_password", "") or "")
     adapter.proxy_rdns = parse_bool(adapter.config.get("proxy_rdns"), True)
     adapter.proxy_secret = parse_str(adapter.config.get("proxy_secret"), "")
+    # lifelike P0-2: fatal-exit watchdog (hidden keys, not in the WebUI template).
+    adapter.lifelike_adapter_watchdog = parse_bool(
+        adapter.config.get("lifelike_adapter_watchdog"), True
+    )
+    # Default 0 = log + health file only, no automatic re-login (ROADMAP P0-2 "no auto restart").
+    adapter.lifelike_fatal_retry_limit = max(
+        0, parse_int(adapter.config.get("lifelike_fatal_retry_limit"), 0)
+    )
+    # lifelike P0-3: INFO commit log records text length instead of the message body.
+    adapter.lifelike_log_redact = parse_bool(
+        adapter.config.get("lifelike_log_redact"), True
+    )
 
 
 def _config_language(config: Any) -> str:

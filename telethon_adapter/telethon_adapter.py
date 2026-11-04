@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import tempfile
@@ -22,6 +23,10 @@ try:
     from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 except ImportError:
     get_astrbot_temp_path = None
+try:
+    from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+except ImportError:
+    get_astrbot_plugin_data_path = None
 try:
     from python_socks import ProxyType
 except ImportError:
@@ -55,6 +60,15 @@ OUTER_RECONNECT_RESET_AFTER_SECONDS = 300.0
 PREMIUM_STATUS_REFRESH_INTERVAL_SECONDS = 300.0
 TELEGRAM_MAX_FILE_BYTES_DEFAULT = 2_097_152_000
 TELEGRAM_MAX_FILE_BYTES_PREMIUM = 4_194_304_000
+# lifelike P0-2: limited retries for non-auth fatal errors before giving up.
+FATAL_RETRY_BASE_DELAY_SECONDS = 30.0
+FATAL_RETRY_MAX_DELAY_SECONDS = 300.0
+HEALTH_DIR_NAME = "telethon_userbot_health"
+HEALTH_STATE_STARTING = "starting"
+HEALTH_STATE_OK = "ok"
+HEALTH_STATE_RECONNECTING = "reconnecting"
+HEALTH_STATE_FATAL = "fatal"
+HEALTH_STATE_STOPPED = "stopped"
 
 
 @register_platform_adapter(
@@ -81,6 +95,7 @@ class TelethonPlatformAdapter(Platform):
         self.client: TelegramClient | None = None
         self.self_id = ""
         self.self_username = ""
+        self.self_usernames: set[str] = set()
         self._running = False
         self._stop_requested = False
         self._main_task: asyncio.Task | None = None
@@ -98,6 +113,12 @@ class TelethonPlatformAdapter(Platform):
         self._media_temp_dir = self._build_media_temp_dir()
         self._message_converter = TelethonMessageConverter(self)
         self._is_premium_user = False
+        # lifelike P0-2 health state (read by Iris AdapterWatchdog via health_snapshot()).
+        self._health_state = HEALTH_STATE_STARTING
+        self._health_reason = ""
+        self._health_since_unix = time.time()
+        self._last_inbound_at_unix: float | None = None
+        self._health_dir: Path | None = None
 
     def meta(self) -> PlatformMetadata:
         adapter_id = str(self.config.get("id") or "telethon_userbot")
@@ -115,6 +136,7 @@ class TelethonPlatformAdapter(Platform):
 
         client_kwargs = self._build_client_kwargs()
         retry_attempt = 0
+        fatal_retries = 0
 
         try:
             self._running = True
@@ -126,6 +148,7 @@ class TelethonPlatformAdapter(Platform):
                 loop = asyncio.get_running_loop()
                 run_started_at = loop.time()
                 disconnected_cleanly = False
+                fatal_retry_now = False
                 try:
                     await self._run_client_once(client_kwargs)
                     disconnected_cleanly = True
@@ -141,9 +164,26 @@ class TelethonPlatformAdapter(Platform):
                 except Exception as exc:
                     if not self._should_retry_client_error(exc):
                         self._record_disconnect(self._describe_disconnect_reason(exc))
-                        raise
-                    self._record_disconnect(self._describe_disconnect_reason(exc))
-                    logger.exception("[Telethon] Client loop failed; recreating TelegramClient")
+                        if loop.time() - run_started_at >= OUTER_RECONNECT_RESET_AFTER_SECONDS:
+                            fatal_retries = 0
+                        if not self._fatal_retry_allowed(exc, fatal_retries):
+                            self._mark_fatal(exc)
+                            raise
+                        # lifelike P0-2: limited retry for non-auth fatal errors.
+                        fatal_retries += 1
+                        fatal_retry_now = True
+                        disconnected_cleanly = False
+                        logger.error(
+                            "[Telethon] Fatal client error type=%s; limited retry %s/%s",
+                            exc.__class__.__name__,
+                            fatal_retries,
+                            self.lifelike_fatal_retry_limit_value(),
+                        )
+                        self._set_health(HEALTH_STATE_RECONNECTING, exc.__class__.__name__)
+                    else:
+                        self._record_disconnect(self._describe_disconnect_reason(exc))
+                        self._set_health(HEALTH_STATE_RECONNECTING, exc.__class__.__name__)
+                        logger.exception("[Telethon] Client loop failed; recreating TelegramClient")
                 finally:
                     uptime = loop.time() - run_started_at
                     await self._disconnect_current_client()
@@ -153,6 +193,7 @@ class TelethonPlatformAdapter(Platform):
 
                 if disconnected_cleanly:
                     self._record_disconnect("clean_disconnect")
+                    self._set_health(HEALTH_STATE_RECONNECTING, "clean_disconnect")
                     logger.warning(
                         "[Telethon] Client disconnected. Recreating TelegramClient: uptime=%.1fs",
                         uptime,
@@ -160,9 +201,13 @@ class TelethonPlatformAdapter(Platform):
 
                 if uptime >= OUTER_RECONNECT_RESET_AFTER_SECONDS:
                     retry_attempt = 0
+                    if not fatal_retry_now:
+                        fatal_retries = 0
                 retry_attempt += 1
                 self._reconnect_attempt = retry_attempt
                 delay = self._compute_reconnect_delay(retry_attempt)
+                if fatal_retry_now:
+                    delay = max(delay, self._compute_fatal_retry_delay(fatal_retries))
                 self._next_reconnect_at_monotonic = loop.time() + delay
                 logger.warning(
                     "[Telethon] Reconnect attempt #%s scheduled in %.1fs",
@@ -179,6 +224,8 @@ class TelethonPlatformAdapter(Platform):
 
     async def terminate(self) -> None:
         self._stop_requested = True
+        if getattr(self, "_health_state", None) != HEALTH_STATE_FATAL:
+            self._set_health(HEALTH_STATE_STOPPED, "terminated")
 
         if self._retry_sleep_task and not self._retry_sleep_task.done():
             self._retry_sleep_task.cancel()
@@ -231,6 +278,32 @@ class TelethonPlatformAdapter(Platform):
         await message_event.send(message_chain)
         await super().send_by_session(session, message_chain)
 
+    async def send_with_receipt(
+        self, session: MessageSesion, message_chain: MessageChain
+    ) -> list[int]:
+        """Send like ``send_by_session`` but return Telegram message ids.
+
+        Local patch. Raises on failure; an empty list means Telegram
+        returned no message object (treat as unconfirmed, not as sent).
+        """
+        if not self.client:
+            raise RuntimeError("[Telethon] Client is not initialized")
+        inner_message = AstrBotMessage()
+        inner_message.session_id = session.session_id
+        inner_message.type = session.message_type
+        message_event = TelethonEvent(
+            message_str=message_chain.get_plain_text(),
+            message_obj=inner_message,
+            platform_meta=self.meta(),
+            session_id=session.session_id,
+            client=self.client,
+        )
+        message_event.adapter_capability = self._build_adapter_capability()
+        message_event.telethon_language = self.language
+        await message_event.send(message_chain)
+        await super().send_by_session(session, message_chain)
+        return list(message_event.get_extra("telethon_sent_message_ids", []) or [])
+
     def get_client(self):
         return self.client
 
@@ -245,17 +318,30 @@ class TelethonPlatformAdapter(Platform):
 
         me = await self.client.get_me()
         self.self_id = str(me.id)
-        self.self_username = str(getattr(me, "username", "") or "").strip().lower()
+        names: list[str] = []
+        primary = str(getattr(me, "username", "") or "").strip().lower()
+        if primary:
+            names.append(primary)
+        # Accounts with multiple / collectible usernames expose them via
+        # ``me.usernames`` while ``me.username`` may be None.
+        for item in getattr(me, "usernames", None) or []:
+            name = str(getattr(item, "username", "") or "").strip().lower()
+            if name and getattr(item, "active", True) and name not in names:
+                names.append(name)
+        self.self_usernames = set(names)
+        self.self_username = names[0] if names else ""
         self._update_premium_status(me)
         self._start_premium_refresh_task()
 
         logger.info(
-            "[Telethon] Userbot started: %s username=%s "
+            "[Telethon] Userbot started: %s username=%s usernames=%s group_self_mention_wakeup=%s "
             "download_incoming_media=%s incoming_media_ttl_seconds=%s "
             "trigger_prefix=%r reply_to_self_triggers_command=%s log_processed_messages_only=%s proxy_type=%s "
             "proxy_host=%s proxy_port=%s fast_upload_enabled=%s raw_event_debug=%s raw_config=%s",
             self.self_id,
             self.self_username,
+            sorted(self.self_usernames),
+            getattr(self, "group_self_mention_wakeup", True),
             self.download_incoming_media,
             self.incoming_media_ttl_seconds,
             self.trigger_prefix,
@@ -298,6 +384,7 @@ class TelethonPlatformAdapter(Platform):
             logger.warning("[Telethon] Raw event debug is enabled; platform logs will include Telethon update summaries")
             self.client.add_event_handler(self._on_raw_event, events.Raw())
 
+        self._set_health(HEALTH_STATE_OK, "connected")
         self._main_task = asyncio.create_task(self.client.run_until_disconnected())
         await self._main_task
 
@@ -444,6 +531,140 @@ class TelethonPlatformAdapter(Platform):
             self._retry_sleep_task = None
             self._next_reconnect_at_monotonic = None
 
+    # ------------------------------------------------------------------
+    # lifelike P0-2: fatal-exit watchdog / health status
+    # ------------------------------------------------------------------
+
+    def _watchdog_enabled(self) -> bool:
+        return bool(getattr(self, "lifelike_adapter_watchdog", True))
+
+    def lifelike_fatal_retry_limit_value(self) -> int:
+        try:
+            return max(0, int(getattr(self, "lifelike_fatal_retry_limit", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _is_never_retry_error(self, exc: Exception) -> bool:
+        """Errors where re-login cannot help or may make things worse.
+
+        - ValueError: bad session string / proxy / config;
+        - FloodError family (incl. FloodWaitError): re-connecting during a flood wait
+          can extend the restriction;
+        - PhoneNumberBannedError and other *Banned* errors.
+        """
+        if isinstance(exc, ValueError):
+            return True
+        name = exc.__class__.__name__
+        if "Flood" in name or "Banned" in name:
+            return True
+        if telethon_errors is None:
+            return False
+        types_ = tuple(
+            t
+            for t in (
+                getattr(telethon_errors, "FloodError", None),
+                getattr(telethon_errors, "FloodWaitError", None),
+                getattr(telethon_errors, "PhoneNumberBannedError", None),
+            )
+            if isinstance(t, type)
+        )
+        return bool(types_) and isinstance(exc, types_)
+
+    def _is_auth_fatal_error(self, exc: Exception) -> bool:
+        """Session/auth failures: retrying cannot help (and may worsen key conflicts)."""
+        message = str(exc).lower()
+        if any(token in message for token in ("authoriz", "session_string", "auth_key", "auth key")):
+            return True
+        if telethon_errors is None:
+            return False
+        common_module = getattr(telethon_errors, "common", None)
+        auth_types = tuple(
+            t
+            for t in (
+                getattr(telethon_errors, "UnauthorizedError", None),
+                getattr(telethon_errors, "AuthKeyError", None),
+                getattr(common_module, "AuthKeyNotFound", None),
+            )
+            if isinstance(t, type)
+        )
+        return bool(auth_types) and isinstance(exc, auth_types)
+
+    def _fatal_retry_allowed(self, exc: Exception, fatal_retries: int) -> bool:
+        if self._stop_requested or not self._watchdog_enabled():
+            return False
+        if self._is_auth_fatal_error(exc) or self._is_never_retry_error(exc):
+            return False
+        return fatal_retries < self.lifelike_fatal_retry_limit_value()
+
+    @staticmethod
+    def _compute_fatal_retry_delay(fatal_retries: int) -> float:
+        exponent = max(0, fatal_retries - 1)
+        delay = FATAL_RETRY_BASE_DELAY_SECONDS * (2 ** exponent)
+        return min(delay, FATAL_RETRY_MAX_DELAY_SECONDS)
+
+    def _mark_fatal(self, exc: Exception) -> None:
+        """Adapter is about to stop for good: never exit silently."""
+        self._set_health(HEALTH_STATE_FATAL, exc.__class__.__name__)
+        if self._stop_requested or not self._watchdog_enabled():
+            return
+        logger.error(
+            "[Telethon] Fatal client error type=%s; adapter task is exiting and will NOT reconnect. "
+            "Health status written as 'fatal'; fix the session/config and restart the adapter.",
+            exc.__class__.__name__,
+        )
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Read-only health view for Iris AdapterWatchdog (no message content)."""
+        client = getattr(self, "client", None)
+        connected: bool | None
+        try:
+            connected = bool(client.is_connected()) if client is not None else False
+        except Exception:
+            connected = None
+        return {
+            "state": getattr(self, "_health_state", HEALTH_STATE_STARTING),
+            "reason": getattr(self, "_health_reason", ""),
+            "since": getattr(self, "_health_since_unix", None),
+            "last_inbound_at": getattr(self, "_last_inbound_at_unix", None),
+            "connected": connected,
+            "reconnect_attempt": getattr(self, "_reconnect_attempt", 0),
+        }
+
+    def _set_health(self, state: str, reason: str = "") -> None:
+        if getattr(self, "_health_state", None) != state:
+            self._health_since_unix = time.time()
+        self._health_state = state
+        self._health_reason = str(reason or "")
+        if self._watchdog_enabled():
+            self._write_health_file()
+
+    def _resolve_health_dir(self) -> Path | None:
+        health_dir = getattr(self, "_health_dir", None)
+        if health_dir is not None:
+            return Path(health_dir)
+        if get_astrbot_plugin_data_path is None:
+            return None
+        try:
+            return Path(get_astrbot_plugin_data_path()) / HEALTH_DIR_NAME
+        except Exception:
+            return None
+
+    def _write_health_file(self) -> None:
+        health_dir = self._resolve_health_dir()
+        if health_dir is None:
+            return
+        try:
+            adapter_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.config.get("id") or "telethon_userbot"))
+            snapshot = self.health_snapshot()
+            snapshot["updated_at"] = time.time()
+            health_dir.mkdir(parents=True, exist_ok=True)
+            path = health_dir / f"{adapter_id}.json"
+            tmp_path = path.with_name(path.name + ".tmp")
+            tmp_path.write_text(json.dumps(snapshot, ensure_ascii=True), encoding="utf-8")
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            logger.warning("[Telethon] Health status write failed: %s", exc.__class__.__name__)
+
     def _record_disconnect(self, reason: str) -> None:
         self._last_disconnect_reason = str(reason or "").strip() or "unknown"
         self._last_disconnect_at_unix = time.time()
@@ -524,6 +745,9 @@ class TelethonPlatformAdapter(Platform):
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
         if not self._running:
             return
+        message = getattr(event, "message", None)
+        if message is not None and not getattr(message, "out", False):
+            self._last_inbound_at_unix = time.time()
         if not getattr(event, "message", None):
             self._log_unprocessed("[Telethon] Ignoring message: empty event.message")
             return
@@ -612,13 +836,24 @@ class TelethonPlatformAdapter(Platform):
             )
             return
 
-        logger.info(
-            "[Telethon] Committing AstrBot event: session_id=%s type=%s sender=%s text=%r",
-            getattr(abm, "session_id", None),
-            getattr(abm, "type", None),
-            getattr(getattr(abm, "sender", None), "user_id", None),
-            getattr(abm, "message_str", ""),
-        )
+        if getattr(self, "lifelike_log_redact", True):
+            # lifelike P0-3: no message body in INFO logs (also covers the window before
+            # Iris installs its log filter, or while Iris is disabled).
+            logger.info(
+                "[Telethon] Committing AstrBot event: session_id=%s type=%s sender=%s text_len=%d",
+                getattr(abm, "session_id", None),
+                getattr(abm, "type", None),
+                getattr(getattr(abm, "sender", None), "user_id", None),
+                len(getattr(abm, "message_str", "") or ""),
+            )
+        else:
+            logger.info(
+                "[Telethon] Committing AstrBot event: session_id=%s type=%s sender=%s text=%r",
+                getattr(abm, "session_id", None),
+                getattr(abm, "type", None),
+                getattr(getattr(abm, "sender", None), "user_id", None),
+                getattr(abm, "message_str", ""),
+            )
         logger.debug(
             "[Telethon] commit_event: platform_id=%s self_id=%s session_id=%s "
             "message_id=%s type=%s component_types=%s",
